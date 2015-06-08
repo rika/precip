@@ -29,9 +29,13 @@ import uuid
 import paramiko
 
 import boto
-from boto.ec2.connection import EC2Connection
-from boto.ec2.regioninfo import *
+#from boto.ec2.connection import EC2Connection
+from boto.ec2.regioninfo import RegionInfo
+from boto.ec2.blockdevicemapping import EBSBlockDeviceType, BlockDeviceMapping
 from boto.exception import EC2ResponseError
+
+from oauth2client.client import GoogleCredentials
+from googleapiclient.discovery import build
 
 __all__ = ["ExperimentException",
            "EC2Experiment",
@@ -470,6 +474,403 @@ class Experiment:
         return exit_codes, outs, errs
 
 
+class GCloudExperiment(Experiment):
+    
+    def __init__(self, zone, project, user='root', name = None):
+        """
+        Initializes an EC2 experiment
+        
+        :param zone: Google Cloud zone, for example us-central1-f
+        :param project: Google Cloud project ID, for example causal-setting-00000
+
+        """
+        Experiment.__init__(self, name = name)
+        
+        self._zone = zone
+        self._project = project
+        self._user = user
+        
+        self._conn = None
+    
+        self._get_connection()
+        self._ssh_keys_setup()
+        
+    def _get_connection(self):
+        """
+        Establishes a connection to the cloud endpoint
+        """
+        if (self._conn != None):
+            return
+        
+        credentials = GoogleCredentials.get_application_default()
+        self._conn = build('compute', 'v1', credentials=credentials)
+        
+    def _ssh_keys_setup(self):
+        
+        """
+        Makes sure we have our experiment keypair registered
+        """
+        uid = self._get_account_id()
+        logger.info("Registering ssh pubkey as 'precip_"+uid+"'")
+        
+        with open(self._ssh_pubkey) as sshfile:
+            contents = sshfile.read()
+            
+        # Get metadata from the cloud
+        request = self._conn.projects().get(project=self._project)
+        response = request.execute()
+        
+        # Check key
+        need_to_register = False
+        body = response['commonInstanceMetadata']
+        if 'items' in body:
+            for item in body['items']:
+                if item['key'] == 'sshKeys':
+                    if contents not in item['value']:
+                        item['value'] = str(item['value']) + '\n' + self._user + ':' + contents
+                    else:
+                        need_to_register = True
+        else:
+            body['items'] = [{'key' : 'sshKeys' },
+                             {'value' : self._user + ':' + contents}]
+        
+        # Register key
+        if need_to_register == True:
+            request = self._conn.projects().setCommonInstanceMetadata(project=self._project, body=body)
+            response = request.execute()
+            self._wait_for_operation(response['name'])
+
+    def _start_instance(self, image_id, instance_type, ebs_size):
+        """
+        Creates a new instance
+        
+        :param instance: the instance to check
+        :return: the instance Boto object
+        """
+        uid = self._get_account_id()
+        boto_instance = None
+        try:
+            # block device maps is only needed if the user wants to specify ebs_size
+            block_device_map = None
+            if ebs_size is not None:
+                dev_sda1 = EBSBlockDeviceType(delete_on_termination = True)
+                dev_sda1.size = int(ebs_size)
+                block_device_map = BlockDeviceMapping()
+                block_device_map['/dev/sda1'] = dev_sda1
+            #else:
+            #    block_device_map = self._conn.get_image_attribute(image_id, 
+            #                                                      attribute = 'blockDeviceMapping')
+
+            # create a boto image object from the image id          
+            image_obj = self._conn.get_image(image_id)
+            if image_obj is None:
+                raise ExperimentException("Image %s does not exist" %(image_id))
+
+            if self._security_groups_support:
+                res = image_obj.run(instance_type = instance_type,
+                                    key_name = "precip_"+uid,
+                                    instance_initiated_shutdown_behavior = "terminate",
+                                    block_device_map = block_device_map,
+                                    security_groups = ["precip"])
+            else:
+                res = image_obj.run(instance_type = instance_type,
+                                    key_name = "precip_"+uid,
+                                    instance_initiated_shutdown_behavior = "terminate",
+                                    block_device_map = block_device_map)
+            boto_instance = res.instances[0]
+
+            logger.info("Started instance %s, type %s" % (boto_instance.id, instance_type))        
+        except Exception as e:
+            raise ExperimentException("Unable to provision a new instance", e)
+        return res.instances[0]
+
+    def _finish_instanciation(self, instance):
+        """
+        Finishes booting and bootstraps an instace
+        
+        :param instance: the instance to check
+        :return: True if the instance is ready, otherwise False
+        """
+        instance_record = []
+        count_ing = 0
+        # check if we are already done
+        if instance.is_fully_instanciated:
+            return True
+            
+        # now, let's wait until the instance i up and running        
+        ec2inst = instance.ec2_instance
+        ec2inst.update()
+        
+        if ec2inst.state == "error":
+            logger.debug("Instance %s state is 'error - scheduling for possible retry" %instance.id)
+            instance.boot_timeout = 0
+            return False
+        
+        if ec2inst.state != "pending" and ec2inst.state != "running":
+            
+            #raise ExperimentException("Unexpected instance state for instance %s: %s" % (instance.id, ec2inst.state))
+            logger.debug("Unexpected instance state for instance %s: %s" % (instance.id, ec2inst.state))
+            return False             
+        
+        if ec2inst.state == "pending":
+            logger.debug("Instance %s is still pending" % instance.id)
+            return False
+        
+        if ec2inst.public_dns_name is None or \
+           ec2inst.public_dns_name == "" or \
+           ec2inst.public_dns_name.startswith('10.'):
+            # we did not get a public address assigned to us, do it now
+
+            # first check if we have unused floating ips laying around
+            addr_to_use = None
+            addresses = self._conn.get_all_addresses()
+            for address in addresses:
+                if address.instance_id is None or address.instance_id == "":
+                    addr_to_use = address.public_ip
+                    break
+
+            if not addr_to_use:
+                logger.debug("Requesting a new public IP address")
+                addr_to_use = self._conn.allocate_address()
+
+            logger.debug("Setting public ip: %s" %(addr_to_use))
+            ec2inst.use_ip(addr_to_use)
+            return False
+    
+        if not self._is_valid_hostaddr(ec2inst.public_dns_name):
+            logger.debug("Waiting for instance %s to boot and be assigned a public IP address" % instance.id)
+            return False
+        
+        # fill out instance fields
+        instance.priv_addr = ec2inst.private_dns_name
+        instance.pub_addr = ec2inst.public_dns_name
+            
+        # bootstrap the image
+        exit_code = -1
+        out = ""
+        err = ""
+        try:
+            logger.debug("Will try to ssh to " + ec2inst.public_dns_name)
+            ssh = SSHConnection()
+            script_path = os.path.dirname(os.path.abspath(__file__)) + "/resources/vm-bootstrap.sh"
+            ssh.put(self._ssh_privkey, ec2inst.public_dns_name, "root", script_path, "/root/vm-bootstrap.sh")
+            exit_code, out, err = ssh.run(self._ssh_privkey, ec2inst.public_dns_name, "root", "chmod 755 /root/vm-bootstrap.sh && /root/vm-bootstrap.sh")
+        except paramiko.SSHException:
+            logger.debug("Failed to run bootstrap script on instance %s. Will retry later." % instance.id)
+            logger.debug("Out: " + out)
+            logger.debug("Err: " + err)
+            return False
+        except paramiko.SFTPError:
+            logger.debug("Unable to ssh connect to instance %s. Will retry later." % instance.id)
+            return False
+        except socket.error:
+            logger.debug("Unable to ssh connect to instance %s. Will retry later." % instance.id)
+            return False
+        
+        if len(out) > 0:
+            logger.info("  stdout: %s" % out)
+        if len(err) > 0:
+            logger.info("  stderr: %s" % err)
+        if exit_code != 0:
+            raise ExperimentException("Bootstrap script exited with error %d" % exit_code)
+        
+        logger.info("Instance %s has booted, public hostname: %s" % (instance.id, ec2inst.public_dns_name))
+
+        # add our tags
+        try:
+            ec2inst.add_tag("Name", "PRECIP - " + self._name)
+            # can only add 10 on EC2
+            tag_count = 1
+            for t in instance.tags:
+                if tag_count >= 10:
+                    break
+                ec2inst.add_tag(t, "1")
+                tag_count += 1
+        except Exception, e:
+            # ignore - the infrastructure might not support user tags
+            pass
+        
+        instance.add_tag(instance.pub_addr)
+        instance.is_fully_instanciated = True
+        return True
+
+    def _retry(self, instance):
+        
+        """
+        In case of reaching timeout for an instance, retry will terminate the previous instance and 
+        replace it with a new instance.
+        
+        :param instance: the instance to terminate and replace with a new one
+        :param image_id: The image id as specified by the cloud infrastructure
+        :param instance_type: The instance type (m1.small, m1.large, ...)
+        :param tags: Tags to add to the new instance - this is important as tags are used throughout the API 
+                     to find and manipulate instances
+        """
+        
+        uid = self._get_account_id()
+        self._get_connection()
+        
+        logger.info("Instance %s has reached timeout, and will be replaced with a new instance" % instance.id)
+        try:
+            self._conn.terminate_instances(instance_ids=[instance.id])
+        except AttributeError as e:
+            logger.warn("Terminating issued an attribute warning")
+        except Exception as e:
+            logger.warn("Ignoring error while terminating instance", e)
+
+        boto_inst = self._start_instance(instance.image_id, instance.instance_type, instance.ebs_size)
+        instance.id = boto_inst.id
+        instance.ec2_instance = boto_inst
+        instance.num_starts = instance.num_starts + 1
+        instance.boot_time = int(time.time())
+
+    def create_instance(compute, project, zone, name):
+        source_disk_image = \
+            "projects/debian-cloud/global/images/debian-7-wheezy-v20150320"
+        machine_type = "zones/%s/machineTypes/n1-standard-1" % zone
+
+        config = _vm_config()
+    
+        return compute.instances().insert(
+            project=project,
+            zone=zone,
+            body=config).execute()
+            
+    def _vm_config(self, name, machine_type, source_disk_image):
+        return {
+            'name': name,
+            'machineType': machine_type,
+    
+            # Specify the boot disk and the image to use as a source.
+            'disks': [
+                {
+                    'boot': True,
+                    'autoDelete': True,
+                    'initializeParams': {
+                        'sourceImage': source_disk_image,
+                    }
+                }
+            ],
+    
+            # Specify a network interface with NAT to access the public
+            # internet.
+            'networkInterfaces': [{
+                'network': 'global/networks/default',
+                'accessConfigs': [
+                    {'type': 'ONE_TO_ONE_NAT', 'name': 'External NAT'}
+                ]
+            }]
+        }
+
+    def provision(self, source_disk_image, instance_type='m1.small', count=1, ebs_size=None, tags=None,
+                  boot_timeout=900, boot_max_tries=3):
+        """
+        Provision a new instance. Note that this method starts the provisioning cycle, but does not
+        block for the instance to finish booting - for that, see wait()
+        
+        :param image_id: The image id as specified by the cloud infrastructure
+        :param instance_type: The instance type (m1.small, m1.large, ...)
+        :param count: Number of instances to provision. The default is 1.
+        :param tags: Tags to add to the instance - this is important as tags are used throughout the API 
+                     to find and manipulate instances
+        :param boot_timeout: The amount of allowed time in seconds for an instance to boot
+        :param boot_max_tries: The number of tries an instance is given to successfully boot
+        """   
+        
+        uid = self._get_account_id()
+        
+        self._get_connection()
+               
+        for i in range(count):
+            gce_inst = self._start_instance(image_id, instance_type, ebs_size)
+
+            instance = Instance(gce_inst.id)
+            instance.ec2_instance = gce_inst
+
+            # keep track of parameters - we might need them for restarts later
+            instance.num_starts = 1
+            instance.boot_time = int(time.time())
+            instance.boot_timeout = boot_timeout
+            instance.boot_max_tries = 3
+            instance.image_id = image_id
+            instance.instance_type = instance_type
+            instance.ebs_size = ebs_size
+            
+            # add basic tags
+            instance.add_tag("precip")
+            instance.add_tag(instance.id)
+            for t in tags:
+                instance.add_tag(t)
+            
+            self._instances.append(instance)
+
+
+    def wait(self, tags=[]):
+        """
+        Barrier for all currently instances to finish booting and be accessible via external addresses.
+        
+        :param tags: set of tags to match against
+        :param timeout: maximum timeout to wait for instances to come up
+        :param maxretrycount: The number of retries in case of failure of provisioning the instances 
+        """
+        
+        count_pending = -1
+        while count_pending != 0:
+            count_pending = 0
+            current_time = int(time.time())
+
+            for i in self._instance_subset(tags):
+                if not self._finish_instanciation(i):
+                    count_pending += 1
+
+                    # did the instance timeout?
+                    if current_time > i.boot_time + i.boot_timeout:
+                        logger.info("Timeout reached while waiting for instances to boot")
+                        logger.info("A common cause for this that your image does not allow the" + \
+                                    " root user to login.")
+                        logger.info("Another common cause is infrastructure problems, preventing" + \
+                                    " the instance from booting correctly.")
+                        if i.num_starts < i.boot_max_tries:
+                            self._retry(i)
+                        else:
+                            raise ExperimentException("Timeout reached while waiting for instances to boot")
+
+            if count_pending > 0:
+                logger.info("Still waiting for %d instances to finish booting" % (count_pending))
+                time.sleep(30)       
+        
+
+    def deprovision(self, tags=[]):
+        """
+        Deprovisions (terminates) instances with the matching tags
+        
+        :param tags: set of tags to match against
+        """
+        self._get_connection()
+        for i in self._instance_subset(tags):
+            logger.info("Deprovisioning instance: %s" % i.id)
+            try:
+                self._conn.terminate_instances(instance_ids=[i.id])
+            except AttributeError as e:
+                logger.warn("Deprovisioning issued an attribute warning")
+            self._instances.remove(i)        
+
+    def _wait_for_operation(self, operation):
+        logger.info('Waiting for operation to finish..')
+        while True:
+            result = self._conn.zoneOperations().get(
+                project=self._project,
+                zone=self._zone,
+                operation=operation).execute()
+    
+            if result['status'] == 'DONE':
+                logger.info("%s done" % operation)
+                if 'error' in result:
+                    raise Exception(result['error'])
+                return result
+            else:
+                time.sleep(1)
+
 
 class EC2Experiment(Experiment):
     
@@ -622,9 +1023,9 @@ class EC2Experiment(Experiment):
             # block device maps is only needed if the user wants to specify ebs_size
             block_device_map = None
             if ebs_size is not None:
-                dev_sda1 = boto.ec2.blockdevicemapping.EBSBlockDeviceType(delete_on_termination = True)
+                dev_sda1 = EBSBlockDeviceType(delete_on_termination = True)
                 dev_sda1.size = int(ebs_size)
-                block_device_map = boto.ec2.blockdevicemapping.BlockDeviceMapping()
+                block_device_map = BlockDeviceMapping()
                 block_device_map['/dev/sda1'] = dev_sda1
             #else:
             #    block_device_map = self._conn.get_image_attribute(image_id, 
