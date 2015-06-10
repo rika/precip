@@ -478,7 +478,7 @@ class Experiment:
 
 class GCloudExperiment(Experiment):
     
-    def __init__(self, project, zone, user='root', name = None):
+    def __init__(self, project, zone, user, name = None):
         """
         Initializes an EC2 experiment
         
@@ -496,7 +496,21 @@ class GCloudExperiment(Experiment):
     
         self._get_connection()
         self._ssh_keys_setup()
-        
+
+    # don't use 'root' user in gcloud 
+    # use sudo in the command string if u need root permission
+    def get(self, tags, user, remote_path, local_path):
+        return Experiment.get(self, tags, remote_path, local_path, user)
+
+    def put(self, tags, user, local_path, remote_path):
+        return Experiment.put(self, tags, local_path, remote_path, user)
+    
+    def run(self, tags, user, cmd, check_exit_code=True, output_base_name=None):
+        return Experiment.run(self, tags, cmd, user=user, check_exit_code=check_exit_code, output_base_name=output_base_name)
+    
+    def copy_and_run(self, tags, user, local_script, args=[], check_exit_code=True):
+        return Experiment.copy_and_run(self, tags, local_script, args=args, user=user, check_exit_code=check_exit_code)
+
     def _get_connection(self):
         """
         Establishes a connection to the cloud endpoint
@@ -646,7 +660,7 @@ class GCloudExperiment(Experiment):
                                               instance=instance.id).execute()
                 
         # get public address
-        instance.pub_addr = response['networkInterfaces'][0]['accessConfigs'][0]['natIP']
+        instance.pub_addr = str(response['networkInterfaces'][0]['accessConfigs'][0]['natIP'])
             
         # bootstrap the image
         exit_code = -1
@@ -656,9 +670,9 @@ class GCloudExperiment(Experiment):
             logger.debug("Will try to ssh to " + instance.id + " (" + instance.pub_addr + ")")
             ssh = SSHConnection()
             script_path = os.path.dirname(os.path.abspath(__file__)) + "/resources/vm-bootstrap.sh"
-            ssh.put(self._ssh_privkey, instance.pub_addr, "root", script_path, "/root/vm-bootstrap.sh")
-            exit_code, out, err = ssh.run(self._ssh_privkey, instance.pub_addr, "root", "chmod 755 /root/vm-bootstrap.sh && /root/vm-bootstrap.sh")
-            h_exit_code, fqdn, h_err = ssh.run(self._ssh_privkey, instance.pub_addr, "root", "hostname -f")
+            ssh.put(self._ssh_privkey, instance.pub_addr, self._user, script_path, "/tmp/vm-bootstrap.sh")
+            exit_code, out, err = ssh.run(self._ssh_privkey, instance.pub_addr, self._user, "sudo chmod 755 /tmp/vm-bootstrap.sh && sudo /tmp/vm-bootstrap.sh")
+            h_exit_code, fqdn, h_err = ssh.run(self._ssh_privkey, instance.pub_addr, self._user, "hostname -f")
             fqdn = fqdn.rstrip('\n')
         except paramiko.SSHException, e:
             logger.debug("Failed to run bootstrap script on instance %s. Will retry later." % instance.id)
@@ -813,6 +827,9 @@ class GCloudExperiment(Experiment):
                                                     instance=i.id)
             responses.append(request.execute())
             self._instances.remove(i)
+        
+        if len(responses) == 0:
+            return
         
         logger.info("Waiting for deprovisioning to complete")    
         while len(responses) > 0:
