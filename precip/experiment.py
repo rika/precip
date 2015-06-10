@@ -526,7 +526,7 @@ class GCloudExperiment(Experiment):
         need_to_register = False
         body = response['commonInstanceMetadata']
         
-        if 'items' not in body:
+        if 'items' in body:
             sshkey_found = False
             for item in body['items']:
                 if item['key'] == 'sshKeys':
@@ -543,6 +543,8 @@ class GCloudExperiment(Experiment):
                               'key' : 'sshKeys' }]
         
         # Register key
+        # key is stored at:
+        # https://console.developers.google.com/project/<your-project>/compute/metadata/sshKeys
         if need_to_register == True:
             response = self._conn.projects().setCommonInstanceMetadata(project=self._project,
                                                                        body=body).execute()
@@ -572,18 +574,18 @@ class GCloudExperiment(Experiment):
                     raise ExperimentException('Timeout for operation: ' + operation)
                 time.sleep(5)
 
-    def _start_instance(self, name, machine_type, source_disk_image):
-        #source_disk_image = \
-        #    "projects/debian-cloud/global/images/debian-7-wheezy-v20150320"
-        #machine_type = "zones/%s/machineTypes/n1-standard-1" % zone
+    def _start_instance(self, name, machine_type, source_disk_image, tags):
 
+        tag_items = []
+        for t in tags:
+            tag_items.append({'key':t, 'value':1})
+            
         config = {
             'name': name,
             'machineType': machine_type,
     
             # Specify the boot disk and the image to use as a source.
-            'disks': [
-                {
+            'disks': [{
                     'boot': True,
                     'autoDelete': True,
                     'initializeParams': {
@@ -595,11 +597,15 @@ class GCloudExperiment(Experiment):
             # Specify a network interface with NAT to access the public
             # internet.
             'networkInterfaces': [{
-                'network': 'global/networks/default',
-                'accessConfigs': [
-                    {'type': 'ONE_TO_ONE_NAT', 'name': 'External NAT'}
-                ]
-            }]
+                    'network': 'global/networks/default',
+                    'accessConfigs': [{'type': 'ONE_TO_ONE_NAT',
+                                       'name': 'External NAT'}]
+                }
+            ],
+            
+            # Metadata is readable from the instance and allows you to
+            # pass configuration from deployment scripts to instances.
+            'metadata': {'items': tag_items}
         }
         response = self._conn.instances().insert(project=self._project,
                                                      zone=self._zone,
@@ -679,15 +685,6 @@ class GCloudExperiment(Experiment):
         
         logger.info("Instance %s has booted, public address: %s" % (instance.id, instance.pub_addr))
 
-        # add our tags
-        body = response['metadata']
-        body['items'] = []
-        for t in instance.tags:
-            body['items'].append({t:1})
-        
-        response = self._conn.instances().setMetadata(project=self._project, zone=self._zone, instance=instance.id, body=body).execute()
-        self._wait_for_operation(response['name'])
-        
         instance.add_tag(instance.pub_addr)
         instance.is_fully_instanciated = True
         return True
@@ -718,7 +715,7 @@ class GCloudExperiment(Experiment):
         instance.num_starts = instance.num_starts + 1
         instance.boot_time = int(time.time())
 
-    def provision(self, source_disk_image, machine_type, count=1, tags=None,
+    def provision(self, source_disk_image, machine_type, count=1, tags=[],
                   boot_timeout=900, boot_max_tries=3):
         """
         Provision a new instance. Note that this method starts the provisioning cycle, but does not
@@ -738,11 +735,16 @@ class GCloudExperiment(Experiment):
         name = 'inst-' + uid[:8] + '-' + str(int(time.time()))
         for i in range(count):
             inst_id = name + '-' + str(i)
-            response = self._start_instance(inst_id, machine_type, source_disk_image)
+            # add basic tags
+            inst_tags = list(tags)
+            inst_tags.append("precip")
+            inst_tags.append(inst_id)
+            
+            response = self._start_instance(inst_id, machine_type, source_disk_image, inst_tags)
 
             instance = Instance(inst_id)
             instance.gce_boot_response = response
-
+            
             # keep track of parameters - we might need them for restarts later
             instance.num_starts = 1
             instance.boot_time = int(time.time())
@@ -751,14 +753,10 @@ class GCloudExperiment(Experiment):
             instance.image_id = source_disk_image
             instance.instance_type = machine_type
             
-            # add basic tags
-            instance.add_tag("precip")
-            instance.add_tag(instance.id)
-            for t in tags:
+            for t in inst_tags:
                 instance.add_tag(t)
             
             self._instances.append(instance)
-
 
     def wait(self, tags=[]):
         """
@@ -813,7 +811,11 @@ class GCloudExperiment(Experiment):
             
         while len(responses) > 0:
             r = responses.pop()
-            self._wait_for_operation(r['name'])        
+            try:
+                self._wait_for_operation(r['name'])
+            except ExperimentException, e:
+                logger.warn('Deprovisioning issued an warning: %s' %str(e))
+                         
 
 
 
