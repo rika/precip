@@ -575,10 +575,6 @@ class GCloudExperiment(Experiment):
                 time.sleep(5)
 
     def _start_instance(self, name, machine_type, source_disk_image, tags):
-
-        tag_items = []
-        for t in tags:
-            tag_items.append({'key':t, 'value':1})
             
         config = {
             'name': name,
@@ -603,9 +599,8 @@ class GCloudExperiment(Experiment):
                 }
             ],
             
-            # Metadata is readable from the instance and allows you to
-            # pass configuration from deployment scripts to instances.
-            'metadata': {'items': tag_items}
+            # Tags
+            'tags': {'items': list(set(tags))}
         }
         response = self._conn.instances().insert(project=self._project,
                                                      zone=self._zone,
@@ -650,8 +645,7 @@ class GCloudExperiment(Experiment):
                                               zone=self._zone,
                                               instance=instance.id).execute()
                 
-        # fill out instance fields
-        instance.priv_addr = response['networkInterfaces'][0]['networkIP']
+        # get public address
         instance.pub_addr = response['networkInterfaces'][0]['accessConfigs'][0]['natIP']
             
         # bootstrap the image
@@ -664,10 +658,11 @@ class GCloudExperiment(Experiment):
             script_path = os.path.dirname(os.path.abspath(__file__)) + "/resources/vm-bootstrap.sh"
             ssh.put(self._ssh_privkey, instance.pub_addr, "root", script_path, "/root/vm-bootstrap.sh")
             exit_code, out, err = ssh.run(self._ssh_privkey, instance.pub_addr, "root", "chmod 755 /root/vm-bootstrap.sh && /root/vm-bootstrap.sh")
-        except paramiko.SSHException:
+            h_exit_code, fqdn, h_err = ssh.run(self._ssh_privkey, instance.pub_addr, "root", "hostname -f")
+            fqdn = fqdn.rstrip('\n')
+        except paramiko.SSHException, e:
             logger.debug("Failed to run bootstrap script on instance %s. Will retry later." % instance.id)
-            logger.debug("Out: " + out)
-            logger.debug("Err: " + err)
+            logger.debug(str(e))
             return False
         except paramiko.SFTPError:
             logger.debug("Unable to ssh connect to instance %s. Will retry later." % instance.id)
@@ -676,12 +671,22 @@ class GCloudExperiment(Experiment):
             logger.debug("Unable to ssh connect to instance %s. Will retry later." % instance.id)
             return False
         
+        
         if len(out) > 0:
-            logger.info("  stdout: %s" % out)
+            logger.debug("  stdout: %s" % out)
         if len(err) > 0:
-            logger.info("  stderr: %s" % err)
+            logger.debug("  stderr: %s" % err)
+        if len(fqdn) > 0:
+            logger.debug("  hostname stdout: %s" % fqdn)
+        if len(h_err) > 0:
+            logger.debug("  hostname stderr: %s" % h_err)
         if exit_code != 0:
             raise ExperimentException("Bootstrap script exited with error %d" % exit_code)
+        if h_exit_code != 0:
+            raise ExperimentException("Bootstrap script exited with error %d" % h_exit_code)
+        
+        # fill remaining fields
+        instance.priv_addr = fqdn
         
         logger.info("Instance %s has booted, public address: %s" % (instance.id, instance.pub_addr))
 
@@ -808,15 +813,16 @@ class GCloudExperiment(Experiment):
                                                     instance=i.id)
             responses.append(request.execute())
             self._instances.remove(i)
-            
+        
+        logger.info("Waiting for deprovisioning to complete")    
         while len(responses) > 0:
             r = responses.pop()
             try:
                 self._wait_for_operation(r['name'])
             except ExperimentException, e:
                 logger.warn('Deprovisioning issued an warning: %s' %str(e))
-                         
-
+                
+        logger.info("Deprovisioning done")                 
 
 
 class EC2Experiment(Experiment):
