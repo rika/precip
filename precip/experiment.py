@@ -399,6 +399,7 @@ class Experiment:
         """
         ssh = SSHConnection()
         for i in self._instance_subset(tags):
+            logger.info("Copying %s to %s on %s" % (local_path, remote_path, i.id))
             ssh.put(self._ssh_privkey, i.pub_addr, user, local_path, remote_path)
     
     def run(self, tags, cmd, user="root", check_exit_code=True, output_base_name=None):
@@ -722,7 +723,7 @@ class GCloudExperiment(Experiment):
         instance.num_starts = instance.num_starts + 1
         instance.boot_time = int(time.time())
 
-    def provision(self, source_disk_image, machine_type, count=1, tags=[],
+    def provision(self, source_disk_image, machine_type, count=1, tags=[], disk_size=10,
                   boot_timeout=900, boot_max_tries=3):
         """
         Provision a new instance. Note that this method starts the provisioning cycle, but does not
@@ -747,7 +748,7 @@ class GCloudExperiment(Experiment):
             inst_tags.append("precip")
             inst_tags.append(inst_id)
             
-            response = self._start_instance(inst_id, machine_type, source_disk_image, inst_tags)
+            response = self._start_instance(inst_id, machine_type, source_disk_image, disk_size, inst_tags)
 
             instance = Instance(inst_id)
             instance.gce_boot_response = response
