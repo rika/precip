@@ -99,6 +99,7 @@ class SSHConnection:
         err = ""
         ssh = self._new_connection(privkey, host, user)
         chan = ssh.get_transport().open_session()
+        chan.get_pty()
         stdin = chan.makefile("wb", -1)
         stdout = chan.makefile("rb", -1)
         stderr = chan.makefile_stderr("rb", -1)
@@ -497,20 +498,6 @@ class GCloudExperiment(Experiment):
         self._get_connection()
         self._ssh_keys_setup()
 
-    # don't use 'root' user in gcloud 
-    # use sudo in the command string if u need root permission
-    def get(self, tags, user, remote_path, local_path):
-        return Experiment.get(self, tags, remote_path, local_path, user)
-
-    def put(self, tags, user, local_path, remote_path):
-        return Experiment.put(self, tags, local_path, remote_path, user)
-    
-    def run(self, tags, user, cmd, check_exit_code=True, output_base_name=None):
-        return Experiment.run(self, tags, cmd, user=user, check_exit_code=check_exit_code, output_base_name=output_base_name)
-    
-    def copy_and_run(self, tags, user, local_script, args=[], check_exit_code=True):
-        return Experiment.copy_and_run(self, tags, local_script, args=args, user=user, check_exit_code=check_exit_code)
-
     def _get_connection(self):
         """
         Establishes a connection to the cloud endpoint
@@ -588,7 +575,7 @@ class GCloudExperiment(Experiment):
                     raise ExperimentException('Timeout for operation: ' + operation)
                 time.sleep(5)
 
-    def _start_instance(self, name, machine_type, source_disk_image, tags):
+    def _start_instance(self, name, machine_type, source_disk_image, disk_size, tags):
             
         config = {
             'name': name,
@@ -600,6 +587,7 @@ class GCloudExperiment(Experiment):
                     'autoDelete': True,
                     'initializeParams': {
                         'sourceImage': source_disk_image,
+                        'diskSizeGb': disk_size
                     }
                 }
             ],
@@ -673,7 +661,7 @@ class GCloudExperiment(Experiment):
             ssh.put(self._ssh_privkey, instance.pub_addr, self._user, script_path, "/tmp/vm-bootstrap.sh")
             exit_code, out, err = ssh.run(self._ssh_privkey, instance.pub_addr, self._user, "sudo chmod 755 /tmp/vm-bootstrap.sh && sudo /tmp/vm-bootstrap.sh")
             h_exit_code, fqdn, h_err = ssh.run(self._ssh_privkey, instance.pub_addr, self._user, "hostname -f")
-            fqdn = fqdn.rstrip('\n')
+            fqdn = fqdn.rstrip('\n').rstrip('\r')
         except paramiko.SSHException, e:
             logger.debug("Failed to run bootstrap script on instance %s. Will retry later." % instance.id)
             logger.debug(str(e))
