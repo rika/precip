@@ -723,7 +723,7 @@ class GCloudExperiment(Experiment):
         except Exception:
             logger.info('Could not delete instance: %s' % instance.id)
             
-        response = self._start_instance(instance.id, instance.instance_type, instance.image_id)
+        response = self._start_instance(instance.id, instance.instance_type, instance.image_id, instance.disk_size, instance.tags)
 
         instance.gce_boot_response = response
         instance.num_starts = instance.num_starts + 1
@@ -768,6 +768,8 @@ class GCloudExperiment(Experiment):
             instance.boot_max_tries = 3
             instance.image_id = source_disk_image
             instance.instance_type = machine_type
+            instance.disk_size = disk_size
+            instance.tags = inst_tags
             
             for t in inst_tags:
                 instance.add_tag(t)
