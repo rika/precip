@@ -498,6 +498,8 @@ class GCloudExperiment(Experiment):
     
         self._get_connection()
         self._ssh_keys_setup()
+        
+        self.counter = 0
 
     def _get_connection(self):
         """
@@ -630,7 +632,8 @@ class GCloudExperiment(Experiment):
 
         if 'error' in response:
             logger.debug("Instance %s state is 'error - scheduling for possible retry" %instance.id)
-            instance.boot_timeout = 0
+            logger.debug("%s" % operation)
+            #instance.boot_timeout = 0
             return False
         
         if response['status'] in ['PENDING', 'RUNNING']: # RUNNING here means the boot script is still running, not the instance
@@ -711,12 +714,15 @@ class GCloudExperiment(Experiment):
         """
         
         logger.info("Instance %s has reached timeout, and will be replaced with a new instance" % instance.id)
-        request = self._conn.instances().delete(project=self._project,
-                                                zone=self._zone,
-                                                instance=instance.id)
-        response = request.execute()
-        self._wait_for_operation(response['name'])
-        
+        try:
+            request = self._conn.instances().delete(project=self._project,
+                                                    zone=self._zone,
+                                                    instance=instance.id)
+            response = request.execute()
+            self._wait_for_operation(response['name'])
+        except Exception:
+            logger.info('Could not delete instance: %s' % instance.id)
+            
         response = self._start_instance(instance.id, instance.instance_type, instance.image_id)
 
         instance.gce_boot_response = response
@@ -738,11 +744,16 @@ class GCloudExperiment(Experiment):
         :param boot_max_tries: The number of tries an instance is given to successfully boot
         """   
         
-        uid = self._get_account_id()
+        #uid = self._get_account_id()
+        #name = 'inst-' + uid[:8] + '-' + str(int(time.time()))
         
-        name = 'inst-' + uid[:8] + '-' + str(int(time.time()))
-        for i in range(count):
-            inst_id = name + '-' + str(i)
+        name = self._name.replace('_', '')
+        if re.search('^(?:[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?)$', name) is None:
+            name = str(uuid.uuid4().get_hex())
+        
+        for _i in range(count):
+            inst_id = name + '-' + str(self.counter)
+            self.counter += 1
             # add basic tags
             inst_tags = list(tags)
             inst_tags.append("precip")
@@ -810,11 +821,14 @@ class GCloudExperiment(Experiment):
         responses = []
         
         for i in self._instance_subset(tags):
-            logger.info("Deprovisioning instance: %s" % i.id)
-            request = self._conn.instances().delete(project=self._project,
-                                                    zone=self._zone,
-                                                    instance=i.id)
-            responses.append(request.execute())
+            try:
+                logger.info("Deprovisioning instance: %s" % i.id)
+                request = self._conn.instances().delete(project=self._project,
+                                                        zone=self._zone,
+                                                        instance=i.id)
+                responses.append(request.execute())
+            except Exception:
+                logger.info('Could not deprovision instance: %s' % i.id)
             self._instances.remove(i)
         
         if len(responses) == 0:
