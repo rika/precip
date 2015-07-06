@@ -633,7 +633,7 @@ class GCloudExperiment(Experiment):
         if 'error' in response:
             logger.debug("Instance %s state is 'error - scheduling for possible retry" %instance.id)
             logger.debug("%s" % operation)
-            #instance.boot_timeout = 0
+            instance.boot_timeout = 0
             return False
         
         if response['status'] in ['PENDING', 'RUNNING']: # RUNNING here means the boot script is still running, not the instance
@@ -743,10 +743,7 @@ class GCloudExperiment(Experiment):
         :param boot_timeout: The amount of allowed time in seconds for an instance to boot
         :param boot_max_tries: The number of tries an instance is given to successfully boot
         """   
-        
-        #uid = self._get_account_id()
-        #name = 'inst-' + uid[:8] + '-' + str(int(time.time()))
-        
+      
         name = self._name.replace('_', '')
         if re.search('^(?:[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?)$', name) is None:
             name = str(uuid.uuid4().get_hex())
