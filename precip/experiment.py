@@ -153,6 +153,7 @@ class Instance:
     ec2_instance = None
     gce_boot_response = None
     is_fully_instanciated = False
+    not_instanciated_correctly = False
     
     def __init__(self, instance_id):
         """
@@ -478,11 +479,86 @@ class Experiment:
         return exit_codes, outs, errs
 
 
+class AzureExperiment(Experiment):
+    def __init__(self, subscription_id, username, password, group_name,
+                 storage_name, virtual_network_name, subnet_name, region,
+                 name = None):
+        Experiment.__init__(self, name = name)
+        
+        self.group_name = group_name
+        self.storage_name = storage_name
+        self.virtual_network_name = virtual_network_name
+        self.subnet_name = subnet_name
+        self.region = region
+        
+        # 0. Authentication
+        credentials = UserPassCredentials(username, password)
+        
+        res_config = ResourceManagementClientConfiguration(
+            credentials,
+            subscription_id
+        )
+        storage_config = StorageManagementClientConfiguration(
+            credentials,
+            subscription_id
+        )
+        network_config = NetworkManagementClientConfiguration(
+            credentials,
+            subscription_id
+        )
+        compute_config = ComputeManagementClientConfiguration(
+            credentials,
+            subscription_id
+        )
+        
+        self.resource_client = ResourceManagementClient(res_config)
+        self.storage_client = StorageManagementClient(storage_config)
+        self.network_client = NetworkManagementClient(network_config)
+        self.compute_client = ComputeManagementClient(compute_config)
+
+        # 1. Create a resource group
+        result = self.resource_client.resource_groups.create_or_update(
+            group_name,
+            ResourceGroup(location=region),
+        )
+        
+        # 2. Create a storage account
+        result = self.storage_client.storage_accounts.create(
+            group_name,
+            storage_name,
+            azure.mgmt.storage.models.StorageAccountCreateParameters(
+                location=region,
+                account_type=azure.mgmt.storage.models.AccountType.standard_lrs,
+            ),
+        )
+        result.wait()
+
+        # 3. Create a virtual network
+        result = self.network_client.virtual_networks.create_or_update(
+            group_name,
+            virtual_network_name,
+            azure.mgmt.network.models.VirtualNetwork(
+                location=region,
+                address_space=azure.mgmt.network.models.AddressSpace(
+                    address_prefixes=[
+                        '10.0.0.0/16',
+                    ],
+                ),
+                subnets=[
+                    azure.mgmt.network.models.Subnet(
+                        name=subnet_name,
+                        address_prefix='10.0.0.0/24',
+                    ),
+                ],
+            ),
+        )
+        result.wait()
+
 class GCloudExperiment(Experiment):
     
     def __init__(self, project, zone, user, name = None):
         """
-        Initializes an EC2 experiment
+        Initializes an GCloud experiment
         
         :param zone: Google Cloud zone, for example us-central1-f
         :param project: Google Cloud project ID, for example causal-setting-00000
@@ -625,6 +701,10 @@ class GCloudExperiment(Experiment):
         if instance.is_fully_instanciated:
             return True
         
+        if instance.not_instanciated_correctly:
+            instance.boot_timeout = 0
+            return False
+        
         operation = instance.gce_boot_response['name']
         response = self._conn.zoneOperations().get(project=self._project, 
                                                    zone=self._zone,
@@ -633,6 +713,8 @@ class GCloudExperiment(Experiment):
         if 'error' in response:
             logger.debug("Instance %s state is 'error - scheduling for possible retry" %instance.id)
             logger.debug("%s" % operation)
+            for error in response['error']['errors']:
+                logger.debug("%s : %s" % (error['code'], error['message']))
             instance.boot_timeout = 0
             return False
         
@@ -728,6 +810,7 @@ class GCloudExperiment(Experiment):
         instance.gce_boot_response = response
         instance.num_starts = instance.num_starts + 1
         instance.boot_time = int(time.time())
+        instance.not_instanciated_correctly = False
 
     def provision(self, source_disk_image, machine_type, count=1, tags=[], disk_size=10,
                   boot_timeout=900, boot_max_tries=3):
@@ -744,9 +827,10 @@ class GCloudExperiment(Experiment):
         :param boot_max_tries: The number of tries an instance is given to successfully boot
         """   
       
-        name = self._name.replace('_', '')
+        name = 'inst-' + self._name.replace('_', '')
         if re.search('^(?:[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?)$', name) is None:
-            name = str(uuid.uuid4().get_hex())
+            name = 'inst-' + str(uuid.uuid4().get_hex())
+        
         
         for _i in range(count):
             inst_id = name + '-' + str(self.counter)
@@ -756,10 +840,14 @@ class GCloudExperiment(Experiment):
             inst_tags.append("precip")
             inst_tags.append(inst_id)
             
-            response = self._start_instance(inst_id, machine_type, source_disk_image, disk_size, inst_tags)
-
             instance = Instance(inst_id)
-            instance.gce_boot_response = response
+            
+            try:
+                response = self._start_instance(inst_id, machine_type, source_disk_image, disk_size, inst_tags)
+                instance.gce_boot_response = response
+            except Exception as e:
+                logger.info("%s" % str(e))
+                instance.not_instanciated_correctly = True
             
             # keep track of parameters - we might need them for restarts later
             instance.num_starts = 1
@@ -769,7 +857,6 @@ class GCloudExperiment(Experiment):
             instance.image_id = source_disk_image
             instance.instance_type = machine_type
             instance.disk_size = disk_size
-            instance.tags = inst_tags
             
             for t in inst_tags:
                 instance.add_tag(t)
@@ -810,7 +897,6 @@ class GCloudExperiment(Experiment):
                 logger.info("Still waiting for %d instances to finish booting" % (count_pending))
                 time.sleep(20)       
         
-
     def deprovision(self, tags=[]):
         """
         Deprovisions (terminates) instances with the matching tags
@@ -825,7 +911,8 @@ class GCloudExperiment(Experiment):
                 request = self._conn.instances().delete(project=self._project,
                                                         zone=self._zone,
                                                         instance=i.id)
-                responses.append(request.execute())
+                response = request.execute()
+                responses.append({'response' : response, 'id' : i.id})
             except Exception:
                 logger.info('Could not deprovision instance: %s' % i.id)
             self._instances.remove(i)
@@ -837,9 +924,16 @@ class GCloudExperiment(Experiment):
         while len(responses) > 0:
             r = responses.pop()
             try:
-                self._wait_for_operation(r['name'])
+                self._wait_for_operation(r['response']['name'])
             except ExperimentException, e:
-                logger.warn('Deprovisioning issued an warning: %s' %str(e))
+                if "RESOURCE_NOT_READY" in str(e):
+                    time.sleep(30)
+                    request = self._conn.instances().delete(project=self._project,
+                                                        zone=self._zone,
+                                                        instance=r['id'])
+                    response = request.execute()
+                else:
+                    logger.warn('Deprovisioning issued an warning: %s' %str(e))
                 
         logger.info("Deprovisioning done")                 
 
