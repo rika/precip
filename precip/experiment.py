@@ -527,20 +527,21 @@ class AzureExperiment(Experiment):
             self.region,
             self.skip_setup,
         )
+        
     def _start_instance(self, name, image_publisher,
                         image_offer, image_sku, image_version,
                         tags, has_public_ip):
-        return self._conn.create_vm(
-                name,
-                self._user,
-                self._ssh_pubkey,
-                image_publisher,
-                image_offer,
-                image_sku,
-                image_version,
-                tags=tags,
-                has_public_ip=has_public_ip
-            )
+        self._conn.create_vm(
+            name,
+            self._user,
+            self._ssh_pubkey,
+            image_publisher,
+            image_offer,
+            image_sku,
+            image_version,
+            tags=tags,
+            has_public_ip=has_public_ip
+        )
     
     def _finish_instanciation(self, instance):
         """
@@ -559,10 +560,11 @@ class AzureExperiment(Experiment):
             return False
         
         try:
-            instance.azure_boot_thread.wait()
+            instance.azure_boot_thread.join()
         except Exception as e:
             logger.debug("Instance %s state is 'error - scheduling for possible retry" %instance.id)
             logger.debug("%s" % str(e))
+            instance.not_instanciated_correctly = True
             return False
         
         # DONE
@@ -623,22 +625,28 @@ class AzureExperiment(Experiment):
         logger.info("Instance %s has reached timeout, and will be replaced with a new instance" % instance.id)
         try:
             self._conn.delete_vm(instance.id)
-        except Exception:
+        except Exception as e:
             logger.info('Could not delete instance: %s' % instance.id)
+            logger.debug("%s" % str(e))
             
-        instance.azure_boot_thread = self._start_instance(
-            instance.id,
-            instance.inst_param['image_publisher'],
-            instance.inst_param['image_offer'],
-            instance.inst_param['image_sku'],
-            instance.inst_param['image_version'],
-            instance.inst_param['inst_tags'],
-            instance.inst_param['has_public_ip'],
+        instance.azure_boot_thread = threading.Thread(
+            target=self._start_instance,
+            args=(
+                instance.id,
+                instance.inst_param['image_publisher'],
+                instance.inst_param['image_offer'],
+                instance.inst_param['image_sku'],
+                instance.inst_param['image_version'],
+                instance.inst_param['tags'],
+                instance.inst_param['has_public_ip'],
+            ),
         )
         
         instance.num_starts = instance.num_starts + 1
         instance.boot_time = int(time.time())
         instance.not_instanciated_correctly = False
+        
+        instance.azure_boot_thread.start()
     
     def provision(self, image_publisher, image_offer, image_sku,
                   image_version, tags=None, has_public_ip=True, 
@@ -659,40 +667,33 @@ class AzureExperiment(Experiment):
         name = 'inst-' + self._name.replace('_', '')
         if re.search('^(?:[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?)$', name) is None:
             name = 'inst-' + str(uuid.uuid4().get_hex())
-        
-        
+    
         for _i in range(count):
             inst_id = name + '-' + str(self.counter)
             self.counter += 1
             
-            # add basic tags
-            inst_tags = {}
-            counter = 0
-            if tags:
-                for t in tags:
-                    inst_tags[counter] = t
-                    counter += 1
-            inst_tags[counter] = "precip"
-            counter += 1
-            inst_tags[counter] = inst_id
-            counter += 1
+            inst_tags = list(tags)
+            inst_tags.append("precip")
+            inst_tags.append(inst_id)
             
             instance = Instance(inst_id)
+            self._instances.append(instance)
+            for t in inst_tags:
+                instance.add_tag(t)
             
-            try:
-                instance.azure_boot_thread = self._start_instance(
+            instance.azure_boot_thread = threading.Thread(
+                target=self._start_instance,
+                args=(
                     inst_id,
                     image_publisher,
                     image_offer,
                     image_sku,
                     image_version,
                     inst_tags,
-                    has_public_ip
-                ) 
-            except Exception as e:
-                logger.info("%s" % str(e))
-                instance.not_instanciated_correctly = True
-            
+                    has_public_ip,
+                ),
+            )
+                
             # keep track of parameters - we might need them for restarts later
             instance.num_starts = 1
             instance.boot_time = int(time.time())
@@ -706,11 +707,9 @@ class AzureExperiment(Experiment):
                 'tags' : inst_tags,
                 'has_public_ip' : has_public_ip
             }
-            
-            for t in inst_tags.values():
-                instance.add_tag(t)
-            
-            self._instances.append(instance)
+        
+            instance.azure_boot_thread.start()
+
 
     def wait(self, tags=[]):
         """
@@ -751,8 +750,9 @@ class AzureExperiment(Experiment):
         try:
             logger.info("Deprovisioning instance: %s" % instance.id)
             self._conn.delete_vm(instance.id)
-        except Exception:
+        except Exception as e:
             logger.info('Could not deprovision instance: %s' % instance.id)
+            logger.debug("%s" % str(e))
                     
 
     def deprovision(self, tags=[]):
@@ -764,7 +764,7 @@ class AzureExperiment(Experiment):
         threads = {}
         subset = self._instance_subset(tags)
         for i in subset:
-            threads[i] = threading.Thread(target=self._deprovision(i))
+            threads[i] = threading.Thread(target=self._deprovision, args=(i,),)
             threads[i].start()
         
         logger.info("Waiting for deprovisioning to complete")
