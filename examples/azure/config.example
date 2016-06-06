@@ -1,0 +1,14 @@
+[Config]
+subscription_id =
+username =
+password =
+group_name =
+storage_name =
+virtual_network_name =
+subnet_name = default
+region = eastus2
+admin_username =
+image_publisher = Canonical
+image_offer = UbuntuServer
+image_sku = 16.04.0-LTS
+image_version = 16.04.201605161

@@ -47,7 +47,7 @@ try:
     # Run a command on the instances having the "test1" tag. In this case we
     # only have one instance, but if you had multiple instances with that
     # tag, the command would run on each one.
-    exp.run(["test1"], USER, "echo 'Hello world from a experiment instance'")
+    exp.run(["test1"], "echo 'Hello world from a experiment instance'", USER)
     
 
 except ExperimentException as e:

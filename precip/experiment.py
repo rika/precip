@@ -25,6 +25,7 @@ import socket
 import subprocess
 import time
 import uuid
+import threading
 
 import paramiko
 
@@ -37,12 +38,15 @@ from boto.exception import EC2ResponseError
 from oauth2client.client import GoogleCredentials
 from googleapiclient.discovery import build
 
+from azure_resource_manager import AzureResourceManager
+
 __all__ = ["ExperimentException",
            "EC2Experiment",
            "NimbusExperiment",
            "EucalyptusExperiment",
            "OpenStackExperiment",
-           "GCloudExperiment"]
+           "GCloudExperiment",
+           "AzureExperiment"]
 
 
 #logging.basicConfig(level=logging.WARN)
@@ -152,6 +156,7 @@ class Instance:
     tags = []
     ec2_instance = None
     gce_boot_response = None
+    azure_boot_thread = None
     is_fully_instanciated = False
     not_instanciated_correctly = False
     
@@ -480,10 +485,16 @@ class Experiment:
 
 
 class AzureExperiment(Experiment):
-    def __init__(self, subscription_id, username, password, group_name,
-                 storage_name, virtual_network_name, subnet_name, region,
-                 name = None):
+    def __init__(self, subscription_id, username, password, admin_username,
+                 group_name, storage_name, virtual_network_name, subnet_name,
+                 region, skip_setup = False, name = None):
         Experiment.__init__(self, name = name)
+        
+        self.subscription_id = subscription_id
+        self.username = username
+        self.password = password
+        
+        self._user = admin_username
         
         self.group_name = group_name
         self.storage_name = storage_name
@@ -491,68 +502,279 @@ class AzureExperiment(Experiment):
         self.subnet_name = subnet_name
         self.region = region
         
-        # 0. Authentication
-        credentials = UserPassCredentials(username, password)
+        self.skip_setup = skip_setup
         
-        res_config = ResourceManagementClientConfiguration(
-            credentials,
-            subscription_id
-        )
-        storage_config = StorageManagementClientConfiguration(
-            credentials,
-            subscription_id
-        )
-        network_config = NetworkManagementClientConfiguration(
-            credentials,
-            subscription_id
-        )
-        compute_config = ComputeManagementClientConfiguration(
-            credentials,
-            subscription_id
-        )
+        self._conn = None
+        self._get_connection()
         
-        self.resource_client = ResourceManagementClient(res_config)
-        self.storage_client = StorageManagementClient(storage_config)
-        self.network_client = NetworkManagementClient(network_config)
-        self.compute_client = ComputeManagementClient(compute_config)
+        self.counter = 0
+        
+    def _get_connection(self):
+        """
+        Establishes a connection to the cloud endpoint
+        """
+        if (self._conn != None):
+            return
+        
+        self._conn = AzureResourceManager(
+            self.subscription_id,
+            self.username,
+            self.password,
+            self.group_name,
+            self.storage_name,
+            self.virtual_network_name,
+            self.subnet_name,
+            self.region,
+            self.skip_setup,
+        )
+    def _start_instance(self, name, image_publisher,
+                        image_offer, image_sku, image_version,
+                        tags, has_public_ip):
+        return self._conn.create_vm(
+                name,
+                self._user,
+                self._ssh_pubkey,
+                image_publisher,
+                image_offer,
+                image_sku,
+                image_version,
+                tags=tags,
+                has_public_ip=has_public_ip
+            )
+    
+    def _finish_instanciation(self, instance):
+        """
+        Finishes booting and bootstraps an instace
+        
+        :param instance: the instance to check
+        :return: True if the instance is ready, otherwise False
+        """
+        
+        # check if we are already done
+        if instance.is_fully_instanciated:
+            return True
+        
+        if instance.not_instanciated_correctly:
+            instance.boot_timeout = 0
+            return False
+        
+        try:
+            instance.azure_boot_thread.wait()
+        except Exception as e:
+            logger.debug("Instance %s state is 'error - scheduling for possible retry" %instance.id)
+            logger.debug("%s" % str(e))
+            return False
+        
+        # DONE
+        
+        # get public and private addresses
+        instance.pub_addr = self._conn.get_pub_addr(instance.id)
+        instance.priv_addr = self._conn.get_priv_addr(instance.id) 
+            
+        # bootstrap the image
+        exit_code = -1
+        out = ""
+        err = ""
+        try:
+            logger.debug("Will try to ssh to " + instance.id + " (" + instance.pub_addr + ")")
+            ssh = SSHConnection()
+            script_path = os.path.dirname(os.path.abspath(__file__)) + "/resources/vm-bootstrap.sh"
+            ssh.put(self._ssh_privkey, instance.pub_addr, self._user, script_path, "/tmp/vm-bootstrap.sh")
+            exit_code, out, err = ssh.run(self._ssh_privkey, instance.pub_addr, self._user, "sudo chmod 755 /tmp/vm-bootstrap.sh && sudo /tmp/vm-bootstrap.sh")
+        except paramiko.SSHException, e:
+            logger.debug("Failed to run bootstrap script on instance %s. Will retry later." % instance.id)
+            logger.debug(str(e))
+            return False
+        except paramiko.SFTPError:
+            logger.debug("Unable to ssh connect to instance %s. Will retry later." % instance.id)
+            return False
+        except socket.error:
+            logger.debug("Unable to ssh connect to instance %s. Will retry later." % instance.id)
+            return False
+        
+        
+        if len(out) > 0:
+            logger.debug("  stdout: %s" % out)
+        if len(err) > 0:
+            logger.debug("  stderr: %s" % err)
+        if exit_code != 0:
+            raise ExperimentException("Bootstrap script exited with error %d" % exit_code)
+        
+        
+        logger.info("Instance %s has booted, public address: %s" % (instance.id, instance.pub_addr))
 
-        # 1. Create a resource group
-        result = self.resource_client.resource_groups.create_or_update(
-            group_name,
-            ResourceGroup(location=region),
+        instance.add_tag(instance.pub_addr)
+        instance.is_fully_instanciated = True
+        return True
+
+    def _retry(self, instance):
+        
+        """
+        In case of reaching timeout for an instance, retry will terminate the previous instance and 
+        replace it with a new instance.
+        
+        :param instance: the instance to terminate and replace with a new one
+        :param image_id: The image id as specified by the cloud infrastructure
+        :param instance_type: The instance type (m1.small, m1.large, ...)
+        :param tags: Tags to add to the new instance - this is important as tags are used throughout the API 
+                     to find and manipulate instances
+        """
+        
+        logger.info("Instance %s has reached timeout, and will be replaced with a new instance" % instance.id)
+        try:
+            self._conn.delete_vm(instance.id)
+        except Exception:
+            logger.info('Could not delete instance: %s' % instance.id)
+            
+        instance.azure_boot_thread = self._start_instance(
+            instance.id,
+            instance.inst_param['image_publisher'],
+            instance.inst_param['image_offer'],
+            instance.inst_param['image_sku'],
+            instance.inst_param['image_version'],
+            instance.inst_param['inst_tags'],
+            instance.inst_param['has_public_ip'],
         )
         
-        # 2. Create a storage account
-        result = self.storage_client.storage_accounts.create(
-            group_name,
-            storage_name,
-            azure.mgmt.storage.models.StorageAccountCreateParameters(
-                location=region,
-                account_type=azure.mgmt.storage.models.AccountType.standard_lrs,
-            ),
-        )
-        result.wait()
+        instance.num_starts = instance.num_starts + 1
+        instance.boot_time = int(time.time())
+        instance.not_instanciated_correctly = False
+    
+    def provision(self, image_publisher, image_offer, image_sku,
+                  image_version, tags=None, has_public_ip=True, 
+                  count=1, boot_timeout=900):
+        """
+        Provision a new instance. Note that this method starts the provisioning cycle, but does not
+        block for the instance to finish booting - for that, see wait()
+        
+        :param image_id: The image id as specified by the cloud infrastructure
+        :param instance_type: The instance type (m1.small, m1.large, ...)
+        :param count: Number of instances to provision. The default is 1.
+        :param tags: Tags to add to the instance - this is important as tags are used throughout the API 
+                     to find and manipulate instances
+        :param boot_timeout: The amount of allowed time in seconds for an instance to boot
+        :param boot_max_tries: The number of tries an instance is given to successfully boot
+        """   
+      
+        name = 'inst-' + self._name.replace('_', '')
+        if re.search('^(?:[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?)$', name) is None:
+            name = 'inst-' + str(uuid.uuid4().get_hex())
+        
+        
+        for _i in range(count):
+            inst_id = name + '-' + str(self.counter)
+            self.counter += 1
+            
+            # add basic tags
+            inst_tags = {}
+            counter = 0
+            if tags:
+                for t in tags:
+                    inst_tags[counter] = t
+                    counter += 1
+            inst_tags[counter] = "precip"
+            counter += 1
+            inst_tags[counter] = inst_id
+            counter += 1
+            
+            instance = Instance(inst_id)
+            
+            try:
+                instance.azure_boot_thread = self._start_instance(
+                    inst_id,
+                    image_publisher,
+                    image_offer,
+                    image_sku,
+                    image_version,
+                    inst_tags,
+                    has_public_ip
+                ) 
+            except Exception as e:
+                logger.info("%s" % str(e))
+                instance.not_instanciated_correctly = True
+            
+            # keep track of parameters - we might need them for restarts later
+            instance.num_starts = 1
+            instance.boot_time = int(time.time())
+            instance.boot_timeout = boot_timeout
+            instance.boot_max_tries = 3
+            instance.inst_param = {
+                'image_publisher' : image_publisher,
+                'image_offer' : image_offer,
+                'image_sku' : image_sku,
+                'image_version' : image_version,
+                'tags' : inst_tags,
+                'has_public_ip' : has_public_ip
+            }
+            
+            for t in inst_tags.values():
+                instance.add_tag(t)
+            
+            self._instances.append(instance)
 
-        # 3. Create a virtual network
-        result = self.network_client.virtual_networks.create_or_update(
-            group_name,
-            virtual_network_name,
-            azure.mgmt.network.models.VirtualNetwork(
-                location=region,
-                address_space=azure.mgmt.network.models.AddressSpace(
-                    address_prefixes=[
-                        '10.0.0.0/16',
-                    ],
-                ),
-                subnets=[
-                    azure.mgmt.network.models.Subnet(
-                        name=subnet_name,
-                        address_prefix='10.0.0.0/24',
-                    ),
-                ],
-            ),
-        )
-        result.wait()
+    def wait(self, tags=[]):
+        """
+        Barrier for all currently instances to finish booting and be accessible via external addresses.
+        
+        :param tags: set of tags to match against
+        :param timeout: maximum timeout to wait for instances to come up
+        :param maxretrycount: The number of retries in case of failure of provisioning the instances 
+        """
+        
+        count_pending = -1
+        while count_pending != 0:
+            count_pending = 0
+            current_time = int(time.time())
+
+            for i in self._instance_subset(tags):
+                if not self._finish_instanciation(i):
+                    count_pending += 1
+
+                    # did the instance timeout?
+                    if current_time > i.boot_time + i.boot_timeout:
+                        logger.info("Timeout reached while waiting for instances to boot")
+                        logger.info("A common cause for this that your image does not allow the" + \
+                                    " root user to login.")
+                        logger.info("Another common cause is infrastructure problems, preventing" + \
+                                    " the instance from booting correctly.")
+                        if i.num_starts < i.boot_max_tries:
+                            self._retry(i)
+                        else:
+                            raise ExperimentException("Timeout reached while waiting for instances to boot")
+
+            if count_pending > 0:
+                logger.info("Still waiting for %d instances to finish booting" % (count_pending))
+                time.sleep(20)       
+
+
+    def _deprovision(self, instance):
+        try:
+            logger.info("Deprovisioning instance: %s" % instance.id)
+            self._conn.delete_vm(instance.id)
+        except Exception:
+            logger.info('Could not deprovision instance: %s' % instance.id)
+                    
+
+    def deprovision(self, tags=[]):
+        """
+        Deprovisions (terminates) instances with the matching tags
+        
+        :param tags: set of tags to match against
+        """
+        threads = {}
+        subset = self._instance_subset(tags)
+        for i in subset:
+            threads[i] = threading.Thread(target=self._deprovision(i))
+            threads[i].start()
+        
+        logger.info("Waiting for deprovisioning to complete")
+        for i in subset:
+            threads[i].join()
+            self._instances.remove(i)
+            
+
+        logger.info("Deprovisioning done")                 
+
 
 class GCloudExperiment(Experiment):
     
