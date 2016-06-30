@@ -23,26 +23,13 @@ exp = None
 try:
 
     exp = AzureExperiment(
-        config.subscription_id,
-        config.username,
-        config.password,
-        config.admin_username,
-        config.group_name,
-        config.storage_name,
-        config.virtual_network_name,
-        config.subnet_name,
-        config.region,
+        config,
         skip_setup = True
     )
     
     exp.provision(
-        config.vm_size,
-        config.image_publisher,
-        config.image_offer,
-        config.image_sku,
-        config.image_version,
         tags=['master'],
-        has_public_ip=False,
+        has_public_ip=True,
         count=1,
         boot_timeout=600
     )
@@ -51,7 +38,7 @@ try:
 
     pprint(exp.list())
    
-    exit_code_list, out_list, err_list = exp.run(["master"], "echo 'Hello world from a experiment instance'", admin_username)
+    exit_code_list, out_list, err_list = exp.run(["master"], "echo 'Hello world from a experiment instance'", config.admin_username)
 
 except ExperimentException as e:
     print "ERROR: %s" % e

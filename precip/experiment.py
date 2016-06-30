@@ -485,23 +485,10 @@ class Experiment:
 
 
 class AzureExperiment(Experiment):
-    def __init__(self, subscription_id, username, password, admin_username,
-                 group_name, storage_name, virtual_network_name, subnet_name,
-                 region, skip_setup = False, name = None):
+    def __init__(self, azure_config, skip_setup = False, name = None):
         Experiment.__init__(self, name = name)
         
-        self.subscription_id = subscription_id
-        self.username = username
-        self.password = password
-        
-        self._user = admin_username
-        
-        self.group_name = group_name
-        self.storage_name = storage_name
-        self.virtual_network_name = virtual_network_name
-        self.subnet_name = subnet_name
-        self.region = region
-        
+        self.config = azure_config
         self.skip_setup = skip_setup
         
         self._conn = None
@@ -517,29 +504,14 @@ class AzureExperiment(Experiment):
             return
         
         self._conn = AzureResourceManager(
-            self.subscription_id,
-            self.username,
-            self.password,
-            self.group_name,
-            self.storage_name,
-            self.virtual_network_name,
-            self.subnet_name,
-            self.region,
-            self.skip_setup,
+            self.config,
+            self.skip_setup
         )
         
-    def _start_instance(self, name, vm_size, image_publisher,
-                        image_offer, image_sku, image_version,
-                        tags, has_public_ip):
+    def _start_instance(self, name, tags, has_public_ip):
         self._conn.create_vm(
             name,
-            self._user,
             self._ssh_pubkey,
-            vm_size,
-            image_publisher,
-            image_offer,
-            image_sku,
-            image_version,
             tags=tags,
             has_public_ip=has_public_ip
         )
@@ -573,35 +545,36 @@ class AzureExperiment(Experiment):
         # get public and private addresses
         instance.pub_addr = self._conn.get_pub_addr(instance.id)
         instance.priv_addr = self._conn.get_priv_addr(instance.id) 
+        
+        if instance.pub_addr != '':    
+            # bootstrap the image
+            exit_code = -1
+            out = ""
+            err = ""
+            try:
+                logger.debug("Will try to ssh to " + instance.id + " (" + instance.pub_addr + ")")
+                ssh = SSHConnection()
+                script_path = os.path.dirname(os.path.abspath(__file__)) + "/resources/vm-bootstrap.sh"
+                ssh.put(self._ssh_privkey, instance.pub_addr, self.config.username, script_path, "/tmp/vm-bootstrap.sh")
+                exit_code, out, err = ssh.run(self._ssh_privkey, instance.pub_addr, self._user, "sudo chmod 755 /tmp/vm-bootstrap.sh && sudo /tmp/vm-bootstrap.sh")
+            except paramiko.SSHException, e:
+                logger.debug("Failed to run bootstrap script on instance %s. Will retry later." % instance.id)
+                logger.debug(str(e))
+                return False
+            except paramiko.SFTPError:
+                logger.debug("Unable to ssh connect to instance %s. Will retry later." % instance.id)
+                return False
+            except socket.error:
+                logger.debug("Unable to ssh connect to instance %s. Will retry later." % instance.id)
+                return False
             
-        # bootstrap the image
-        exit_code = -1
-        out = ""
-        err = ""
-        try:
-            logger.debug("Will try to ssh to " + instance.id + " (" + instance.pub_addr + ")")
-            ssh = SSHConnection()
-            script_path = os.path.dirname(os.path.abspath(__file__)) + "/resources/vm-bootstrap.sh"
-            ssh.put(self._ssh_privkey, instance.pub_addr, self._user, script_path, "/tmp/vm-bootstrap.sh")
-            exit_code, out, err = ssh.run(self._ssh_privkey, instance.pub_addr, self._user, "sudo chmod 755 /tmp/vm-bootstrap.sh && sudo /tmp/vm-bootstrap.sh")
-        except paramiko.SSHException, e:
-            logger.debug("Failed to run bootstrap script on instance %s. Will retry later." % instance.id)
-            logger.debug(str(e))
-            return False
-        except paramiko.SFTPError:
-            logger.debug("Unable to ssh connect to instance %s. Will retry later." % instance.id)
-            return False
-        except socket.error:
-            logger.debug("Unable to ssh connect to instance %s. Will retry later." % instance.id)
-            return False
-        
-        
-        if len(out) > 0:
-            logger.debug("  stdout: %s" % out)
-        if len(err) > 0:
-            logger.debug("  stderr: %s" % err)
-        if exit_code != 0:
-            raise ExperimentException("Bootstrap script exited with error %d" % exit_code)
+            
+            if len(out) > 0:
+                logger.debug("  stdout: %s" % out)
+            if len(err) > 0:
+                logger.debug("  stderr: %s" % err)
+            if exit_code != 0:
+                raise ExperimentException("Bootstrap script exited with error %d" % exit_code)
         
         
         logger.info("Instance %s has booted, public address: %s" % (instance.id, instance.pub_addr))
@@ -634,10 +607,6 @@ class AzureExperiment(Experiment):
             target=self._start_instance,
             args=(
                 instance.id,
-                instance.inst_param['image_publisher'],
-                instance.inst_param['image_offer'],
-                instance.inst_param['image_sku'],
-                instance.inst_param['image_version'],
                 instance.inst_param['tags'],
                 instance.inst_param['has_public_ip'],
             ),
@@ -649,8 +618,7 @@ class AzureExperiment(Experiment):
         
         instance.azure_boot_thread.start()
     
-    def provision(self, vm_size, image_publisher, image_offer, image_sku,
-                  image_version, tags=None, has_public_ip=True, 
+    def provision(self, tags=None, has_public_ip=True, 
                   count=1, boot_timeout=900):
         """
         Provision a new instance. Note that this method starts the provisioning cycle, but does not
@@ -686,11 +654,6 @@ class AzureExperiment(Experiment):
                 target=self._start_instance,
                 args=(
                     inst_id,
-                    vm_size,
-                    image_publisher,
-                    image_offer,
-                    image_sku,
-                    image_version,
                     inst_tags,
                     has_public_ip,
                 ),
@@ -702,10 +665,6 @@ class AzureExperiment(Experiment):
             instance.boot_timeout = boot_timeout
             instance.boot_max_tries = 3
             instance.inst_param = {
-                'image_publisher' : image_publisher,
-                'image_offer' : image_offer,
-                'image_sku' : image_sku,
-                'image_version' : image_version,
                 'tags' : inst_tags,
                 'has_public_ip' : has_public_ip
             }
