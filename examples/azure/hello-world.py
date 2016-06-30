@@ -6,6 +6,7 @@ import time
 from pprint import pprint
 
 from precip import AzureExperiment
+from precip import ExperimentException
 from azure_config import AzureConfig
 
 
@@ -35,12 +36,14 @@ try:
     )
     
     exp.provision(
+        config.vm_size,
         config.image_publisher,
         config.image_offer,
         config.image_sku,
         config.image_version,
         tags=['master'],
-        count=60,
+        has_public_ip=False,
+        count=1,
         boot_timeout=600
     )
 

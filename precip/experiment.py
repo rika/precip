@@ -528,13 +528,14 @@ class AzureExperiment(Experiment):
             self.skip_setup,
         )
         
-    def _start_instance(self, name, image_publisher,
+    def _start_instance(self, name, vm_size, image_publisher,
                         image_offer, image_sku, image_version,
                         tags, has_public_ip):
         self._conn.create_vm(
             name,
             self._user,
             self._ssh_pubkey,
+            vm_size,
             image_publisher,
             image_offer,
             image_sku,
@@ -648,7 +649,7 @@ class AzureExperiment(Experiment):
         
         instance.azure_boot_thread.start()
     
-    def provision(self, image_publisher, image_offer, image_sku,
+    def provision(self, vm_size, image_publisher, image_offer, image_sku,
                   image_version, tags=None, has_public_ip=True, 
                   count=1, boot_timeout=900):
         """
@@ -685,6 +686,7 @@ class AzureExperiment(Experiment):
                 target=self._start_instance,
                 args=(
                     inst_id,
+                    vm_size,
                     image_publisher,
                     image_offer,
                     image_sku,
