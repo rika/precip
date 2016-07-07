@@ -555,8 +555,8 @@ class AzureExperiment(Experiment):
                 logger.debug("Will try to ssh to " + instance.id + " (" + instance.pub_addr + ")")
                 ssh = SSHConnection()
                 script_path = os.path.dirname(os.path.abspath(__file__)) + "/resources/vm-bootstrap.sh"
-                ssh.put(self._ssh_privkey, instance.pub_addr, self.config.username, script_path, "/tmp/vm-bootstrap.sh")
-                exit_code, out, err = ssh.run(self._ssh_privkey, instance.pub_addr, self._user, "sudo chmod 755 /tmp/vm-bootstrap.sh && sudo /tmp/vm-bootstrap.sh")
+                ssh.put(self._ssh_privkey, instance.pub_addr, self.config.admin_username, script_path, "/tmp/vm-bootstrap.sh")
+                exit_code, out, err = ssh.run(self._ssh_privkey, instance.pub_addr, self.config.admin_username, "sudo chmod 755 /tmp/vm-bootstrap.sh && sudo /tmp/vm-bootstrap.sh")
             except paramiko.SSHException, e:
                 logger.debug("Failed to run bootstrap script on instance %s. Will retry later." % instance.id)
                 logger.debug(str(e))

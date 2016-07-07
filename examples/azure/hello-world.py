@@ -40,6 +40,8 @@ try:
    
     exit_code_list, out_list, err_list = exp.run(["master"], "echo 'Hello world from a experiment instance'", config.admin_username)
 
+    raw_input('Press ENTER...')
+
 except ExperimentException as e:
     print "ERROR: %s" % e
 
