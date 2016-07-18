@@ -632,9 +632,9 @@ class AzureExperiment(Experiment):
         :param boot_max_tries: The number of tries an instance is given to successfully boot
         """   
       
-        name = 'inst-' + self._name.replace('_', '')
+        name = self._name.replace('_', '')
         if re.search('^(?:[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?)$', name) is None:
-            name = 'inst-' + str(uuid.uuid4().get_hex())
+            name = str(uuid.uuid4().get_hex())
     
         for _i in range(count):
             inst_id = name + '-' + str(self.counter)
