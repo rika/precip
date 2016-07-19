@@ -713,7 +713,7 @@ class AzureExperiment(Experiment):
             try:
                 logger.info("Deprovisioning instance: %s" % instance.id)
                 self._conn.delete_vm(instance.id)
-                
+                done = True
             except Exception as e:
                 logger.info('Could not deprovision instance: %s' % instance.id)
                 logger.debug("%s" % str(e))
