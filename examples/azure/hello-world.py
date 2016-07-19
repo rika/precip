@@ -24,7 +24,8 @@ try:
 
     exp = AzureExperiment(
         config,
-        skip_setup = True
+        skip_setup = True,
+        name='test'
     )
     
     exp.provision(
