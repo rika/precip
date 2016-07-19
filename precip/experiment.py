@@ -707,12 +707,24 @@ class AzureExperiment(Experiment):
 
 
     def _deprovision(self, instance):
-        try:
-            logger.info("Deprovisioning instance: %s" % instance.id)
-            self._conn.delete_vm(instance.id)
-        except Exception as e:
-            logger.info('Could not deprovision instance: %s' % instance.id)
-            logger.debug("%s" % str(e))
+        attempts=3
+        done = False
+        while (done == False):
+            try:
+                logger.info("Deprovisioning instance: %s" % instance.id)
+                self._conn.delete_vm(instance.id)
+                
+            except Exception as e:
+                logger.info('Could not deprovision instance: %s' % instance.id)
+                logger.debug("%s" % str(e))
+                
+                if (attempts > 0):
+                    logger.info('Retrying in some secs..')
+                    time.sleep(20)
+                    attempts = attempts-1
+                else:
+                    logger.info('Not retrying anymore')
+                    done = True
                     
 
     def deprovision(self, tags=[]):
