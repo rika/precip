@@ -618,7 +618,7 @@ class AzureExperiment(Experiment):
         
         instance.azure_boot_thread.start()
     
-    def provision(self, tags=None, has_public_ip=True, count=1, boot_timeout=900):
+    def provision(self, tags=None, has_public_ip=True, count=1, boot_timeout=400):
         """
         Provision a new instance. Note that this method starts the provisioning cycle, but does not
         block for the instance to finish booting - for that, see wait()
