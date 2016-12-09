@@ -423,6 +423,8 @@ class Experiment:
         err_list = []
         ssh = SSHConnection()
         for i in self._instance_subset(tags):
+            if not i.is_fully_instanciated:
+                raise ExperimentException("Can't ssh a not fully instanciated instance "+ i.id)
             logger.info("Scheduling command execution on %s: %s" % (i.id, cmd))
             exit_code = -1
             out = ""
@@ -461,6 +463,7 @@ class Experiment:
             err_list.append(err)
                 
             if check_exit_code and exit_code != 0:
+                print out_list, err_list
                 raise ExperimentException("Command exited with exit code %d" % exit_code)
         
         return exit_code_list, out_list, err_list
@@ -577,7 +580,7 @@ class AzureExperiment(Experiment):
                 raise ExperimentException("Bootstrap script exited with error %d" % exit_code)
         
         
-        logger.info("Instance %s has booted, public address: %s" % (instance.id, instance.pub_addr))
+        logger.info("Instance %s has booted, priv address: %s, public address: %s" % (instance.id, instance.priv_addr, instance.pub_addr))
 
         instance.add_tag(instance.pub_addr)
         instance.is_fully_instanciated = True
@@ -708,6 +711,7 @@ class AzureExperiment(Experiment):
 
     def _deprovision(self, instance):
         attempts=3
+        instance.is_fully_instanciated = False
         done = False
         while (done == False):
             try:
