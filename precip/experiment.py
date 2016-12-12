@@ -87,7 +87,7 @@ class SSHConnection:
         hkeys = ssh.get_host_keys()
         hkeys.clear()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(host, username=user, key_filename=privkey, allow_agent=False, look_for_keys=False)
+        ssh.connect(host, 22, username=user, key_filename=privkey, allow_agent=False, look_for_keys=False)
         transport = ssh.get_transport()
         transport.set_keepalive(30)
         return ssh
@@ -407,6 +407,20 @@ class Experiment:
         for i in self._instance_subset(tags):
             logger.info("Copying %s to %s on %s" % (local_path, remote_path, i.id))
             ssh.put(self._ssh_privkey, i.pub_addr, user, local_path, remote_path)
+            
+    def put_priv(self, tags, local_path, remote_path, user="root"):
+        """
+        Transfers a local file to a set of instances matching the given tags
+        
+        :param tags: set of tags to match against
+        :param local_path: local location for the source file
+        :param remote_path: location of where to copy the file to
+        :param user: user to transfer as, default is 'root'
+        """
+        ssh = SSHConnection()
+        for i in self._instance_subset(tags):
+            logger.info("Copying %s to %s on %s" % (local_path, remote_path, i.id))
+            ssh.put(self._ssh_privkey, i.priv_addr, user, local_path, remote_path)
     
     def run(self, tags, cmd, user="root", check_exit_code=True, output_base_name=None):
         """
