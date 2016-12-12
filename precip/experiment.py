@@ -394,7 +394,7 @@ class Experiment:
             # should we do checks on the target path? Directory check? Existing file check?
             ssh.get(self._ssh_privkey, i.pub_addr, user, remote_path, modified_local_path)
 
-    def put(self, tags, local_path, remote_path, user="root"):
+    def put(self, tags, local_path, remote_path, user="root", priv=False):
         """
         Transfers a local file to a set of instances matching the given tags
         
@@ -406,23 +406,10 @@ class Experiment:
         ssh = SSHConnection()
         for i in self._instance_subset(tags):
             logger.info("Copying %s to %s on %s" % (local_path, remote_path, i.id))
-            ssh.put(self._ssh_privkey, i.pub_addr, user, local_path, remote_path)
-            
-    def put_priv(self, tags, local_path, remote_path, user="root"):
-        """
-        Transfers a local file to a set of instances matching the given tags
-        
-        :param tags: set of tags to match against
-        :param local_path: local location for the source file
-        :param remote_path: location of where to copy the file to
-        :param user: user to transfer as, default is 'root'
-        """
-        ssh = SSHConnection()
-        for i in self._instance_subset(tags):
-            logger.info("Copying %s to %s on %s" % (local_path, remote_path, i.id))
-            ssh.put(self._ssh_privkey, i.priv_addr, user, local_path, remote_path)
+            addr = i.pub_addr if priv is False else i.priv_addr
+            ssh.put(self._ssh_privkey, addr, user, local_path, remote_path)
     
-    def run(self, tags, cmd, user="root", check_exit_code=True, output_base_name=None):
+    def run(self, tags, cmd, user="root", check_exit_code=True, output_base_name=None, priv=False):
         """
         Runs a command on set of instances matching the tags given.
         
@@ -444,7 +431,8 @@ class Experiment:
             out = ""
             err = ""
             try:
-                exit_code, out, err = ssh.run(self._ssh_privkey, i.pub_addr, user, cmd)
+                addr = i.pub_addr if priv is False else i.priv_addr
+                exit_code, out, err = ssh.run(self._ssh_privkey, addr, user, cmd)
             except Exception, e:
                 raise ExperimentException("Error running ssh command", e)
 
